@@ -1,0 +1,596 @@
+#!/usr/bin/env bash
+# ship - safe, boring releases for a single-server app.
+#
+#   ship deploy <release.tar.gz> [--dry-run] [--force] [--config FILE] [--root DIR]
+#   ship rollback [--restore-db BACKUP] [--dry-run] [--config FILE] [--root DIR]
+#   ship status   [--json] [--config FILE] [--root DIR]
+#   ship verify <release.tar.gz>
+#
+# Layout under $SHIP_ROOT:
+#   releases/<id>/     immutable, unpacked releases
+#   current            symlink to the live release (switched with an atomic rename)
+#   shared/            data that survives releases (database, backups)
+#   state/             lock, history, previous-release pointer, log
+#   ship.conf          configuration (see examples/ship.conf)
+#
+# Exit codes:
+#   0 ok   1 unexpected error   2 usage/config error   3 another deploy holds the lock
+#   4 artifact failed verification (checksum, manifest, unsafe paths)
+#   5 database backup could not be taken or verified (nothing was changed)
+#   6 preflight failed: migration on the copy or a pre-switch hook (nothing was changed)
+#   7 deploy failed AFTER the switch and was automatically rolled back (previous release is serving)
+#   8 deploy failed and the rollback ALSO failed: manual intervention needed
+#   9 a required tool is missing
+set -Eeuo pipefail
+
+SHIP_VERSION="0.1.0"
+# GNU tar treats "C:/x" as a remote host; --force-local keeps Windows-style paths working in Git Bash.
+TAR=(tar); if tar --force-local --version >/dev/null 2>&1; then TAR=(tar --force-local); fi
+EX_USAGE=2 EX_LOCK=3 EX_ARTIFACT=4 EX_BACKUP=5 EX_PREFLIGHT=6 EX_ROLLED_BACK=7 EX_ROLLBACK_FAILED=8 EX_TOOL=9
+
+# ----------------------------------------------------------------------------- logging
+LOG_FILE=""
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+# log LEVEL STEP MESSAGE [key=value ...]  -> one logfmt line per event
+log() {
+  local level="$1" step="$2" msg="$3"; shift 3
+  local line
+  line="ts=$(ts) level=$level step=$step msg=\"${msg//\"/\'}\""
+  local kv
+  for kv in "$@"; do line+=" ${kv%%=*}=\"${kv#*=}\""; done
+  if [[ "$level" == "error" || "$level" == "warn" ]]; then echo "$line" >&2; else echo "$line"; fi
+  if [[ -n "$LOG_FILE" && -d "$(dirname "$LOG_FILE")" ]]; then echo "$line" >>"$LOG_FILE" 2>/dev/null || true; fi
+}
+die() { local code="$1"; shift; log error "$1" "$2" "${@:3}"; exit "$code"; }
+
+usage() { sed -n 2,26p "$0" | sed 's/^# \{0,1\}//'; }
+
+# ----------------------------------------------------------------------------- config
+ROOT="${SHIP_ROOT:-}"
+CONFIG="${SHIP_CONFIG:-}"
+DRY=0 FORCE=0 JSON=0 RESTORE_FROM=""
+ARGS=()
+
+load_config() {
+  [[ -n "$ROOT" ]] || die $EX_USAGE config "no root: set SHIP_ROOT or pass --root DIR"
+  ROOT="${ROOT%/}"
+  [[ -n "$CONFIG" ]] || CONFIG="$ROOT/ship.conf"
+  [[ -f "$CONFIG" ]] || die $EX_USAGE config "config file not found" "path=$CONFIG"
+  # Defaults, then the operator-owned config (it is sourced: treat it like code you wrote).
+  SERVICE="" HEALTH_URL="" HEALTH_TIMEOUT=30 HEALTH_INTERVAL=1 HEALTH_VERSION_FIELD=version
+  DB_PATH="" DB_KIND=sqlite BACKUP_DIR="" BACKUP_KEEP=10 KEEP_RELEASES=5
+  MIGRATE_CMD="" SMOKE_FILE="" SYSTEMCTL="systemctl" ROLLBACK_RESTORE_DB="if-migrated"
+  PRE_SWITCH_HOOK="" POST_SUCCESS_HOOK="" SQLITE3="${SHIP_SQLITE3:-sqlite3}"
+  # shellcheck source=/dev/null
+  source "$CONFIG"
+  [[ -n "$SERVICE" ]] || die $EX_USAGE config "SERVICE is required"
+  [[ -n "$HEALTH_URL" ]] || die $EX_USAGE config "HEALTH_URL is required"
+  [[ "$KEEP_RELEASES" =~ ^[0-9]+$ && "$KEEP_RELEASES" -ge 2 ]] || die $EX_USAGE config "KEEP_RELEASES must be an integer >= 2"
+  [[ "$BACKUP_KEEP" =~ ^[0-9]+$ && "$BACKUP_KEEP" -ge 1 ]] || die $EX_USAGE config "BACKUP_KEEP must be an integer >= 1"
+  [[ "$HEALTH_TIMEOUT" =~ ^[0-9]+$ ]] || die $EX_USAGE config "HEALTH_TIMEOUT must be an integer (seconds)"
+  case "$DB_KIND" in sqlite | file) ;; *) die $EX_USAGE config "DB_KIND must be sqlite or file" ;; esac
+  case "$ROLLBACK_RESTORE_DB" in if-migrated | always | never) ;; *) die $EX_USAGE config "ROLLBACK_RESTORE_DB must be if-migrated, always or never" ;; esac
+  [[ -n "$BACKUP_DIR" ]] || BACKUP_DIR="$ROOT/shared/backups"
+  if [[ -n "$DB_PATH" && "$DB_PATH" == *"'"* ]]; then die $EX_USAGE config "DB_PATH must not contain a single quote"; fi
+  read -ra SYSTEMCTL_CMD <<<"$SYSTEMCTL"
+  STATE="$ROOT/state" RELEASES="$ROOT/releases" CURRENT="$ROOT/current"
+  LOG_FILE="$STATE/ship.log"
+}
+
+need_tools() {
+  local t
+  for t in tar sha256sum curl readlink mv ln date sed awk grep "${SYSTEMCTL_CMD[0]}"; do
+    command -v "$t" >/dev/null 2>&1 || die $EX_TOOL prereq "required tool not found" "tool=$t"
+  done
+  if [[ -n "$DB_PATH" && "$DB_KIND" == sqlite ]]; then pick_sqlite_tool; fi
+}
+
+# ----------------------------------------------------------------------------- sqlite helpers
+# Prefers the sqlite3 CLI (its .backup uses SQLite's online backup API); falls back to python3.
+DB_TOOL=""
+pick_sqlite_tool() {
+  if [[ "${SHIP_DB_TOOL:-}" != python ]] && command -v "$SQLITE3" >/dev/null 2>&1; then DB_TOOL=cli; return; fi
+  local py
+  for py in python3 python; do
+    if command -v "$py" >/dev/null 2>&1 && "$py" -c 'import sqlite3' >/dev/null 2>&1; then DB_TOOL="$py"; return; fi
+  done
+  die $EX_TOOL prereq "need the sqlite3 CLI or python3 with the sqlite3 module"
+}
+# Both helpers connect with a busy timeout so a writer in progress does not fail the backup.
+db_backup() { # SRC DST
+  if [[ "$DB_TOOL" == cli ]]; then
+    "$SQLITE3" "$1" ".timeout 10000" ".backup '$2'"
+  else
+    "$DB_TOOL" -c 'import sqlite3,sys
+s=sqlite3.connect(sys.argv[1],timeout=10); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()' "$1" "$2"
+  fi
+}
+db_scalar() { # FILE SQL -> first value
+  if [[ "$DB_TOOL" == cli ]]; then
+    "$SQLITE3" "$1" "$2" | head -n 1
+  else
+    "$DB_TOOL" -c 'import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); r=c.execute(sys.argv[2]).fetchone(); print("" if r is None else r[0])' "$1" "$2"
+  fi
+}
+db_integrity() { # FILE -> 0 only if integrity_check says exactly "ok"
+  local out
+  out="$(db_scalar "$1" "PRAGMA integrity_check;" 2>&1)" || return 1
+  [[ "$out" == "ok" ]]
+}
+file_sha() { sha256sum "$1" | awk '{print $1}'; }
+
+# ----------------------------------------------------------------------------- small helpers
+json_get() { # KEY  (reads JSON on stdin; flat string/number fields only, by design)
+  tr -d '\n\r' | sed -nE 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"?([^",}]*)"?.*/\1/p' | head -n 1
+}
+svc() { "${SYSTEMCTL_CMD[@]}" "$@"; }
+current_target() { # absolute path of the live release, or empty
+  local t
+  t="$(readlink "$CURRENT" 2>/dev/null || true)"
+  if [[ -n "$t" && "$t" != /* && ! "$t" =~ ^[A-Za-z]:[/\\] ]]; then t="$ROOT/$t"; fi
+  echo "$t"
+}
+release_version() { # RELEASE_DIR -> version from its manifest
+  [[ -f "$1/MANIFEST.json" ]] && json_get version <"$1/MANIFEST.json" || true
+}
+release_schema() {
+  [[ -f "$1/MANIFEST.json" ]] && json_get schema_version <"$1/MANIFEST.json" || true
+}
+atomic_switch() { # TARGET_DIR: replace the symlink with a single rename(2)
+  ln -sfn "$1" "$CURRENT.new"
+  mv -T "$CURRENT.new" "$CURRENT"
+}
+
+# ----------------------------------------------------------------------------- locking
+LOCK="" LOCK_HELD=0
+lock_pid_alive() { local p; p="$(cat "$LOCK/pid" 2>/dev/null || true)"; [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; }
+acquire_lock() {
+  LOCK="$STATE/lock"
+  mkdir -p "$STATE"
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    if lock_pid_alive; then
+      die $EX_LOCK lock "another ship process holds the lock" "pid=$(cat "$LOCK/pid")" "path=$LOCK"
+    fi
+    log warn lock "removing stale lock (owner process is gone)" "path=$LOCK"
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || die $EX_LOCK lock "lost a race for the lock"
+  fi
+  echo "$$" >"$LOCK/pid"
+  LOCK_HELD=1
+}
+check_lock_dry() { # dry-run must not create anything, but should tell you a real run would be refused
+  LOCK="$STATE/lock"
+  if [[ -d "$LOCK" ]] && lock_pid_alive; then
+    die $EX_LOCK lock "another ship process holds the lock (a real run would be refused)" "pid=$(cat "$LOCK/pid")"
+  fi
+}
+
+# ----------------------------------------------------------------------------- cleanup
+TMP_PARTIAL="" CREATED_REL=""
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  [[ -n "$TMP_PARTIAL" && -d "$TMP_PARTIAL" ]] && rm -rf "$TMP_PARTIAL"
+  [[ -n "${COPY_DIR:-}" && -d "${COPY_DIR:-}" ]] && rm -rf "$COPY_DIR"
+  # A release directory we created but never switched to is garbage: remove it.
+  if [[ -n "$CREATED_REL" && "${SWITCHED:-0}" -eq 0 && -d "$CREATED_REL" ]]; then rm -rf "$CREATED_REL"; fi
+  if (( LOCK_HELD )); then rm -rf "$LOCK"; fi
+  exit "$rc"
+}
+
+# ----------------------------------------------------------------------------- health / smoke
+HEALTH_BODY=""
+# health_wait EXPECTED_VERSION TIMEOUT -> 0 when /health answers 2xx and reports that version
+health_wait() {
+  local want="$1" timeout="$2" deadline got state
+  deadline=$((SECONDS + timeout))
+  while :; do
+    if HEALTH_BODY="$(curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null)"; then
+      got="$(printf '%s' "$HEALTH_BODY" | json_get "$HEALTH_VERSION_FIELD")"
+      if [[ -z "$want" || "$got" == "$want" ]]; then return 0; fi
+      HEALTH_NOTE="healthy but reports version '$got', expected '$want'"
+    else
+      HEALTH_NOTE="no healthy response yet"
+    fi
+    state="$(svc is-active "$SERVICE" 2>/dev/null || true)"
+    if [[ "$state" == failed ]]; then HEALTH_NOTE="service state is 'failed'"; return 1; fi
+    if (( SECONDS >= deadline )); then return 1; fi
+    sleep "$HEALTH_INTERVAL"
+  done
+}
+HEALTH_NOTE=""
+
+# Smoke file: METHOD PATH STATUS [| text the body must contain [| request body]]
+run_smoke() {
+  [[ -n "$SMOKE_FILE" ]] || { log info smoke "no SMOKE_FILE configured, skipping"; return 0; }
+  [[ -f "$SMOKE_FILE" ]] || { log error smoke "SMOKE_FILE not found" "path=$SMOKE_FILE"; return 1; }
+  local base="${HEALTH_URL%/*}" line head needle data method path want code body n=0 fail=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
+    IFS='|' read -r head needle data <<<"$line"
+    read -r method path want <<<"$head"
+    needle="$(echo "$needle" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    data="$(echo "$data" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    n=$((n + 1))
+    local args=(-sS --max-time 10 -o - -w $'\n%{http_code}' -X "$method")
+    if [[ -n "$data" ]]; then args+=(-H 'Content-Type: application/json' --data "$data"); fi
+    if ! body="$(curl "${args[@]}" "$base$path" 2>&1)"; then
+      log error smoke "request failed" "check=$method $path" "detail=${body:0:200}"; fail=1; continue
+    fi
+    code="${body##*$'\n'}"; body="${body%$'\n'*}"
+    if [[ "$code" != "$want" ]]; then
+      log error smoke "unexpected status" "check=$method $path" "want=$want" "got=$code"; fail=1; continue
+    fi
+    if [[ -n "$needle" && "$body" != *"$needle"* ]]; then
+      log error smoke "body missing expected text" "check=$method $path" "needle=$needle"; fail=1; continue
+    fi
+    log info smoke "ok" "check=$method $path" "status=$code"
+  done <"$SMOKE_FILE"
+  (( n > 0 )) || log warn smoke "smoke file has no checks"
+  (( fail == 0 ))
+}
+
+# ----------------------------------------------------------------------------- backup / restore
+BACKUP_FILE=""
+take_backup() { # REL_ID  -> sets BACKUP_FILE; refuses (return 1) unless the copy verifies
+  local rel_id="$1" stamp dst
+  if [[ -z "$DB_PATH" ]]; then log info backup "no DB_PATH configured, skipping"; return 0; fi
+  if [[ ! -f "$DB_PATH" ]]; then log info backup "database does not exist yet (first deploy), skipping" "db=$DB_PATH"; return 0; fi
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  dst="$BACKUP_DIR/$(basename "$DB_PATH").$stamp.pre-$rel_id.bak"
+  mkdir -p "$BACKUP_DIR"
+  if [[ "$DB_KIND" == sqlite ]]; then
+    if ! db_backup "$DB_PATH" "$dst" 2>"$dst.err"; then
+      log error backup "online backup failed" "detail=$(head -c 300 "$dst.err" | tr '\n' ' ')"
+      rm -f "$dst" "$dst.err"; return 1
+    fi
+    rm -f "$dst.err"
+    if ! db_integrity "$dst"; then
+      log error backup "backup failed integrity_check, refusing to continue" "file=$dst"
+      mv -f "$dst" "$dst.bad"; return 1
+    fi
+    local a b
+    a="$(db_scalar "$DB_PATH" "SELECT count(*) FROM sqlite_master;" 2>/dev/null || echo "?")"
+    b="$(db_scalar "$dst" "SELECT count(*) FROM sqlite_master;" 2>/dev/null || echo "!")"
+    if [[ "$a" != "$b" ]]; then
+      log error backup "backup schema differs from source" "source_objects=$a" "backup_objects=$b"
+      mv -f "$dst" "$dst.bad"; return 1
+    fi
+  else
+    log warn backup "DB_KIND=file: plain copy, only consistent if the app is idle (use sqlite for online backups)"
+    cp -p "$DB_PATH" "$dst" || return 1
+    cmp -s "$DB_PATH" "$dst" || { log error backup "copy differs from source"; rm -f "$dst"; return 1; }
+  fi
+  # The sidecar marks the backup as verified; the monitor's freshness check looks for it.
+  printf 'sha256=%s\nverified_at=%s\nrelease=%s\n' "$(file_sha "$dst")" "$(ts)" "$rel_id" >"$dst.ok"
+  BACKUP_FILE="$dst"
+  log info backup "verified backup written" "file=$dst" "bytes=$(wc -c <"$dst" | tr -d ' ')"
+}
+restore_db() { # BACKUP -> replace DB_PATH with the verified backup (service must be stopped)
+  local src="$1" keep
+  [[ -f "$src" ]] || { log error restore "backup file missing" "file=$src"; return 1; }
+  if [[ -f "$src.ok" ]]; then
+    local want; want="$(sed -n 's/^sha256=//p' "$src.ok")"
+    [[ "$(file_sha "$src")" == "$want" ]] || { log error restore "backup checksum no longer matches its record" "file=$src"; return 1; }
+  fi
+  if [[ -f "$DB_PATH" ]]; then
+    keep="$DB_PATH.failed-$(date -u +%Y%m%dT%H%M%SZ)"
+    cp -p "$DB_PATH" "$keep" && log info restore "kept the post-failure database for inspection" "file=$keep"
+  fi
+  rm -f "$DB_PATH-wal" "$DB_PATH-shm" "$DB_PATH-journal"
+  cp -p "$src" "$DB_PATH"
+  if [[ "$DB_KIND" == sqlite ]] && ! db_integrity "$DB_PATH"; then
+    log error restore "restored database failed integrity_check" "db=$DB_PATH"; return 1
+  fi
+  log info restore "database restored from backup" "file=$src"
+}
+
+run_migrate() { # DB_FILE RELEASE_DIR VERSION
+  ( cd "$2" && SHIP_DB_PATH="$1" SHIP_RELEASE_DIR="$2" SHIP_RELEASE_VERSION="$3" bash -c "$MIGRATE_CMD" )
+}
+
+# ----------------------------------------------------------------------------- rollback engine
+# auto_rollback REASON  (uses SWITCHED, MIGRATED, PREV, BACKUP_FILE)
+auto_rollback() {
+  local reason="$1" want_restore=0 prev_version
+  log error rollback "ROLLING BACK" "reason=$reason"
+  if [[ -z "$PREV" || ! -d "$PREV" ]]; then
+    log error rollback "no previous release to return to (first deploy); service left as is"
+    return 1
+  fi
+  svc stop "$SERVICE" || true
+  case "$ROLLBACK_RESTORE_DB" in
+    always) want_restore=1 ;;
+    if-migrated) (( MIGRATED )) && want_restore=1 ;;
+  esac
+  if (( want_restore )); then
+    if [[ -n "$BACKUP_FILE" ]]; then
+      restore_db "$BACKUP_FILE" || { log error rollback "database restore failed"; return 1; }
+    else
+      log warn rollback "restore requested but no backup was taken in this run"
+    fi
+  elif (( MIGRATED )); then
+    log warn rollback "database NOT restored (ROLLBACK_RESTORE_DB=$ROLLBACK_RESTORE_DB); the previous code runs against the migrated schema"
+  fi
+  atomic_switch "$PREV"
+  svc restart "$SERVICE" || { log error rollback "could not restart the service"; return 1; }
+  prev_version="$(release_version "$PREV")"
+  if health_wait "$prev_version" "$HEALTH_TIMEOUT"; then
+    log info rollback "previous release is serving again" "release=$(basename "$PREV")" "version=$prev_version"
+    return 0
+  fi
+  log error rollback "previous release did not become healthy" "note=$HEALTH_NOTE"
+  return 1
+}
+
+# ----------------------------------------------------------------------------- commands
+SWITCHED=0 MIGRATED=0 PREV=""
+
+cmd_verify() {
+  local tarball="${ARGS[0]:-}"
+  [[ -f "$tarball" ]] || die $EX_USAGE verify "usage: ship verify <release.tar.gz>"
+  verify_artifact "$tarball" || exit $EX_ARTIFACT
+  log info verify "artifact ok" "version=$A_VERSION" "git_sha=$A_SHA" "schema_version=$A_SCHEMA"
+}
+
+A_VERSION="" A_SHA="" A_SCHEMA="" A_NAME=""
+verify_artifact() { # TARBALL -> checksum, path safety, manifest
+  local tarball="$1" sumfile="$1.sha256" want got manifest
+  [[ -f "$sumfile" ]] || { log error verify "checksum file missing" "file=$sumfile"; return 1; }
+  want="$(awk '{print $1}' "$sumfile" | head -n 1)"
+  got="$(file_sha "$tarball")"
+  if [[ "$want" != "$got" ]]; then
+    log error verify "CHECKSUM MISMATCH, refusing to deploy" "expected=$want" "actual=$got"; return 1
+  fi
+  log info verify "checksum ok" "sha256=$got"
+  if "${TAR[@]}" -tzf "$tarball" | grep -Eq '(^/|^[A-Za-z]:|(^|/)\.\.(/|$))'; then
+    log error verify "archive contains absolute or parent-relative paths"; return 1
+  fi
+  manifest="$("${TAR[@]}" -xzOf "$tarball" ./MANIFEST.json 2>/dev/null || true)"
+  [[ -n "$manifest" ]] || { log error verify "MANIFEST.json missing from archive"; return 1; }
+  A_NAME="$(printf '%s' "$manifest" | json_get name)"
+  A_VERSION="$(printf '%s' "$manifest" | json_get version)"
+  A_SHA="$(printf '%s' "$manifest" | json_get git_sha)"
+  A_SCHEMA="$(printf '%s' "$manifest" | json_get schema_version)"
+  [[ "$A_VERSION" =~ ^[A-Za-z0-9._+-]+$ ]] || { log error verify "manifest version missing or unsafe" "version=$A_VERSION"; return 1; }
+  [[ "$A_SHA" =~ ^[A-Za-z0-9]{7,64}$ ]] || { log error verify "manifest git_sha missing or malformed"; return 1; }
+  [[ "$A_SCHEMA" =~ ^[0-9]+$ ]] || { log error verify "manifest schema_version missing or not a number"; return 1; }
+  log info verify "manifest ok" "name=$A_NAME" "version=$A_VERSION" "git_sha=$A_SHA" "schema_version=$A_SCHEMA"
+}
+
+cmd_deploy() {
+  local tarball="${ARGS[0]:-}"
+  [[ -n "$tarball" && -f "$tarball" ]] || die $EX_USAGE deploy "usage: ship deploy <release.tar.gz> [--dry-run] [--force]"
+  load_config; need_tools
+  LOG_FILE="$STATE/ship.log"
+  (( DRY )) && log info deploy "DRY RUN: nothing will be changed" || true
+  if (( DRY )); then check_lock_dry; else acquire_lock; trap cleanup EXIT; fi
+
+  verify_artifact "$tarball" || exit $EX_ARTIFACT
+  local rel_id="$A_VERSION-${A_SHA:0:7}" rel="$RELEASES/$A_VERSION-${A_SHA:0:7}"
+  PREV="$(current_target)"
+  local prev_schema="" need_migrate=0
+  [[ -n "$PREV" && -d "$PREV" ]] && prev_schema="$(release_schema "$PREV")"
+  if [[ -n "$MIGRATE_CMD" && "$prev_schema" != "$A_SCHEMA" ]]; then need_migrate=1; fi
+  log info plan "deploy plan" "release=$rel_id" "previous=${PREV:+$(basename "$PREV")}" "schema=${prev_schema:-none}->$A_SCHEMA" "migrate=$need_migrate"
+
+  if [[ -n "$PREV" && "$(basename "$PREV")" == "$rel_id" && $FORCE -eq 0 ]]; then
+    log info deploy "release is already live; use --force to redeploy" "release=$rel_id"
+    exit 0
+  fi
+
+  # 1. unpack (into a hidden dir, then one rename, so a half-unpacked release can never be switched to)
+  if [[ -f "$rel/.ship-complete" ]]; then
+    log info unpack "release already unpacked, reusing" "dir=$rel"
+  elif (( DRY )); then
+    log info unpack "[dry-run] would unpack" "dir=$rel"
+  else
+    mkdir -p "$RELEASES"
+    TMP_PARTIAL="$RELEASES/.partial.$$"
+    rm -rf "$TMP_PARTIAL" "$rel"; mkdir -p "$TMP_PARTIAL"
+    "${TAR[@]}" -xzf "$tarball" -C "$TMP_PARTIAL" || die $EX_ARTIFACT unpack "tar extraction failed"
+    : >"$TMP_PARTIAL/.ship-complete"
+    mv "$TMP_PARTIAL" "$rel"; TMP_PARTIAL=""
+    CREATED_REL="$rel"
+    log info unpack "release unpacked" "dir=$rel"
+  fi
+
+  # 2. verified backup. If it cannot be verified we stop here, before touching anything.
+  if (( DRY )); then
+    log info backup "[dry-run] would take and verify an online backup" "db=${DB_PATH:-none}"
+  else
+    take_backup "$rel_id" || die $EX_BACKUP backup "no verified backup, aborting before any change"
+  fi
+
+  # 3. preflight migration against a COPY of the verified backup
+  if (( need_migrate )); then
+    if (( DRY )); then
+      log info preflight "[dry-run] would run the migration against a copy of the database"
+    else
+      COPY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ship-preflight.XXXXXX")"
+      if command -v cygpath >/dev/null 2>&1; then COPY_DIR="$(cygpath -m "$COPY_DIR")"; fi  # Git Bash: hand native paths to node
+      if [[ -n "$BACKUP_FILE" ]]; then cp "$BACKUP_FILE" "$COPY_DIR/db"; fi
+      log info preflight "running migration on a copy of the verified backup"
+      if ! run_migrate "$COPY_DIR/db" "$rel" "$A_VERSION" >"$COPY_DIR/out" 2>&1; then
+        log error preflight "migration FAILED on the copy; live data untouched" "detail=$(tail -c 400 "$COPY_DIR/out" | tr '\n' ' ')"
+        exit $EX_PREFLIGHT
+      fi
+      if [[ "$DB_KIND" == sqlite && -f "$COPY_DIR/db" ]] && ! db_integrity "$COPY_DIR/db"; then
+        log error preflight "migrated copy failed integrity_check"; exit $EX_PREFLIGHT
+      fi
+      log info preflight "migration succeeded on the copy"
+      rm -rf "$COPY_DIR"; COPY_DIR=""
+    fi
+  fi
+
+  if [[ -n "$PRE_SWITCH_HOOK" ]]; then
+    if (( DRY )); then
+      log info hook "[dry-run] would run pre-switch hook" "cmd=$PRE_SWITCH_HOOK"
+    else
+      ( cd "$rel" && SHIP_RELEASE_DIR="$rel" SHIP_RELEASE_VERSION="$A_VERSION" bash -c "$PRE_SWITCH_HOOK" ) \
+        || { log error hook "pre-switch hook failed, nothing switched"; exit $EX_PREFLIGHT; }
+    fi
+  fi
+
+  if (( DRY )); then
+    log info switch "[dry-run] would (migrate=$need_migrate: stop service and migrate), switch current -> $rel_id, restart $SERVICE"
+    log info health "[dry-run] would wait up to ${HEALTH_TIMEOUT}s for $HEALTH_URL to report version $A_VERSION"
+    log info smoke "[dry-run] would run smoke checks from ${SMOKE_FILE:-(none)}"
+    log info deploy "dry run complete, no changes made"
+    exit 0
+  fi
+
+  # 4. point of no return: from here on any failure triggers the automatic rollback
+  local fail_reason=""
+  if (( need_migrate )); then
+    log info migrate "stopping $SERVICE and migrating the live database"
+    svc stop "$SERVICE" || true
+    MIGRATED=1
+    if ! run_migrate "${DB_PATH:-}" "$rel" "$A_VERSION"; then fail_reason="live migration failed"; fi
+  fi
+  if [[ -z "$fail_reason" ]]; then
+    atomic_switch "$rel"; SWITCHED=1
+    log info switch "current now points at the new release" "release=$rel_id"
+    if ! svc restart "$SERVICE"; then fail_reason="systemctl restart failed"; fi
+  fi
+  if [[ -z "$fail_reason" ]]; then
+    log info health "waiting for health" "url=$HEALTH_URL" "version=$A_VERSION" "timeout=${HEALTH_TIMEOUT}s"
+    if health_wait "$A_VERSION" "$HEALTH_TIMEOUT"; then
+      log info health "healthy" "version=$A_VERSION"
+    else
+      fail_reason="health check failed: $HEALTH_NOTE"
+    fi
+  fi
+  if [[ -z "$fail_reason" ]] && ! run_smoke; then fail_reason="smoke checks failed"; fi
+
+  if [[ -n "$fail_reason" ]]; then
+    local rc=$EX_ROLLED_BACK
+    auto_rollback "$fail_reason" || rc=$EX_ROLLBACK_FAILED
+    echo "$(ts) deploy $rel_id FAILED rc=$rc reason=$fail_reason" >>"$STATE/history"
+    if (( rc == EX_ROLLBACK_FAILED )); then
+      log error deploy "DEPLOY FAILED AND ROLLBACK FAILED: manual intervention needed" "see=journalctl -u $SERVICE"
+    else
+      log error deploy "deploy failed; automatically rolled back" "reason=$fail_reason"
+      printf '%s\n' "$rel" >"$STATE/failed"
+    fi
+    exit "$rc"
+  fi
+
+  # 5. success bookkeeping
+  [[ -n "$PREV" && "$PREV" != "$rel" ]] && printf '%s\n' "$PREV" >"$STATE/previous"
+  echo "$(ts) deploy $rel_id OK" >>"$STATE/history"
+  touch "$rel"
+  if [[ -n "$POST_SUCCESS_HOOK" ]]; then
+    ( cd "$rel" && SHIP_RELEASE_DIR="$rel" SHIP_RELEASE_VERSION="$A_VERSION" bash -c "$POST_SUCCESS_HOOK" ) \
+      || log warn hook "post-success hook failed (deploy is still good)"
+  fi
+  prune_releases "$rel"
+  prune_backups
+  log info deploy "DEPLOY OK" "release=$rel_id" "version=$A_VERSION"
+}
+
+prune_releases() { # CURRENT_REL
+  local keep_n="$KEEP_RELEASES" i=0 d prev
+  prev="$(cat "$STATE/previous" 2>/dev/null || true)"
+  # shellcheck disable=SC2012
+  while IFS= read -r d; do
+    d="$RELEASES/$d"; i=$((i + 1))
+    if [[ "$d" == "$1" || "$d" == "$prev" ]]; then continue; fi
+    if (( i > keep_n )); then rm -rf "$d"; log info prune "removed old release" "dir=$d"; fi
+  done < <(ls -1t "$RELEASES" 2>/dev/null)
+}
+prune_backups() {
+  local i=0 f
+  # shellcheck disable=SC2012
+  while IFS= read -r f; do
+    i=$((i + 1))
+    if (( i > BACKUP_KEEP )); then rm -f "$BACKUP_DIR/$f" "$BACKUP_DIR/$f.ok"; log info prune "removed old backup" "file=$f"; fi
+  done < <(cd "$BACKUP_DIR" 2>/dev/null && ls -1t -- *.bak 2>/dev/null)
+}
+
+cmd_rollback() {
+  load_config; need_tools
+  if (( DRY )); then check_lock_dry; else acquire_lock; trap cleanup EXIT; fi
+  local from to
+  from="$(current_target)"
+  to="$(cat "$STATE/previous" 2>/dev/null || true)"
+  [[ -n "$to" && -d "$to" ]] || die $EX_USAGE rollback "no previous release recorded (or it was pruned)"
+  [[ -n "$from" ]] || die $EX_USAGE rollback "no current release"
+  log info rollback "plan" "from=$(basename "$from")" "to=$(basename "$to")" "restore_db=${RESTORE_FROM:-no}"
+  if (( DRY )); then log info rollback "dry run complete, no changes made"; exit 0; fi
+  svc stop "$SERVICE" || true
+  if [[ -n "$RESTORE_FROM" ]]; then
+    [[ -n "$DB_PATH" ]] || die $EX_USAGE rollback "--restore-db needs DB_PATH in the config"
+    restore_db "$RESTORE_FROM" || { log error rollback "restore failed; service left stopped"; exit $EX_ROLLBACK_FAILED; }
+  fi
+  atomic_switch "$to"
+  svc restart "$SERVICE" || { log error rollback "restart failed"; exit $EX_ROLLBACK_FAILED; }
+  local v; v="$(release_version "$to")"
+  if health_wait "$v" "$HEALTH_TIMEOUT"; then
+    printf '%s\n' "$from" >"$STATE/previous"
+    echo "$(ts) rollback $(basename "$from") -> $(basename "$to") OK" >>"$STATE/history"
+    log info rollback "ROLLBACK OK" "now=$(basename "$to")" "version=$v"
+  else
+    log error rollback "rolled-back release is not healthy" "note=$HEALTH_NOTE"
+    exit $EX_ROLLBACK_FAILED
+  fi
+}
+
+cmd_status() {
+  load_config; need_tools
+  local cur prev svcstate hv="" health="down" latest="" latest_ok="no" releases
+  cur="$(current_target)"; prev="$(cat "$STATE/previous" 2>/dev/null || true)"
+  svcstate="$(svc is-active "$SERVICE" 2>/dev/null || true)"; svcstate="${svcstate:-unknown}"
+  if body="$(curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null)"; then health="ok"; hv="$(printf '%s' "$body" | json_get "$HEALTH_VERSION_FIELD")"; fi
+  # shellcheck disable=SC2012
+  latest="$(cd "$BACKUP_DIR" 2>/dev/null && ls -1t -- *.bak 2>/dev/null | head -n 1)"
+  [[ -n "$latest" && -f "$BACKUP_DIR/$latest.ok" ]] && latest_ok="yes"
+  # shellcheck disable=SC2012
+  releases="$(ls -1t "$RELEASES" 2>/dev/null | tr '\n' ' ')"
+  if (( JSON )); then
+    printf '{"current":"%s","previous":"%s","service":"%s","health":"%s","health_version":"%s","latest_backup":"%s","latest_backup_verified":"%s"}\n' \
+      "$(basename "${cur:-}")" "$(basename "${prev:-}")" "$svcstate" "$health" "$hv" "$latest" "$latest_ok"
+  else
+    echo "current   : $([[ -n "$cur" ]] && basename "$cur" || echo '(none)')"
+    echo "previous  : $([[ -n "$prev" ]] && basename "$prev" || echo '(none)')"
+    echo "releases  : ${releases:-(none)}"
+    echo "service   : $svcstate"
+    echo "health    : $health${hv:+ (version $hv)}"
+    echo "backup    : ${latest:-(none)} verified=$latest_ok"
+    [[ -f "$STATE/history" ]] && { echo "history   :"; tail -n 5 "$STATE/history" | sed 's/^/  /'; }
+  fi
+  [[ "$health" == ok && "$svcstate" == active ]]
+}
+
+# ----------------------------------------------------------------------------- main
+main() {
+  local cmd="${1:-}"
+  [[ -n "$cmd" ]] || { usage; exit $EX_USAGE; }
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) DRY=1 ;;
+      --force) FORCE=1 ;;
+      --json) JSON=1 ;;
+      --config) CONFIG="${2:?--config needs a file}"; shift ;;
+      --root) ROOT="${2:?--root needs a directory}"; shift ;;
+      --restore-db) RESTORE_FROM="${2:?--restore-db needs a backup file}"; shift ;;
+      -h | --help) usage; exit 0 ;;
+      -*) die $EX_USAGE usage "unknown option" "option=$1" ;;
+      *) ARGS+=("$1") ;;
+    esac
+    shift
+  done
+  case "$cmd" in
+    deploy) cmd_deploy ;;
+    rollback) cmd_rollback ;;
+    status) cmd_status ;;
+    verify) cmd_verify ;;
+    version | --version) echo "ship $SHIP_VERSION" ;;
+    -h | --help | help) usage ;;
+    *) die $EX_USAGE usage "unknown command" "command=$cmd" ;;
+  esac
+}
+main "$@"

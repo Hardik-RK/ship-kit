@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# ship-build - package a directory into a versioned, checksummed release tarball.
+#
+#   ship-build --name NAME --version X.Y.Z --src DIR [--out DIR] [--migrations SUBDIR] [--sha GITSHA]
+#
+# Produces, in --out (default ./dist):
+#   NAME-VERSION-SHA7.tar.gz         the release (contains ./MANIFEST.json)
+#   NAME-VERSION-SHA7.tar.gz.sha256  "<hash>  <file>" (verify with sha256sum -c)
+#
+# MANIFEST.json records name, version, git_sha, schema_version, built_at.
+# schema_version is the highest numeric filename prefix inside --migrations
+# (e.g. 003_add_index.sql -> 3), or 0 when there are no migrations.
+# The git sha comes from --sha, else `git rev-parse HEAD` inside --src.
+set -Eeuo pipefail
+
+NAME="" VERSION="" SRC="" OUT="./dist" MIGRATIONS="migrations" SHA=""
+die() { echo "ship-build: $*" >&2; exit 2; }
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name) NAME="${2:?}"; shift 2 ;;
+    --version) VERSION="${2:?}"; shift 2 ;;
+    --src) SRC="${2:?}"; shift 2 ;;
+    --out) OUT="${2:?}"; shift 2 ;;
+    --migrations) MIGRATIONS="${2:?}"; shift 2 ;;
+    --sha) SHA="${2:?}"; shift 2 ;;
+    -h | --help) sed -n 2,15p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+[[ "$NAME" =~ ^[A-Za-z0-9_-]+$ ]] || die "--name must match [A-Za-z0-9_-]+"
+[[ "$VERSION" =~ ^[A-Za-z0-9._+-]+$ ]] || die "--version must match [A-Za-z0-9._+-]+"
+[[ -d "$SRC" ]] || die "--src is not a directory: $SRC"
+
+DIRTY=false
+if [[ -z "$SHA" ]]; then
+  SHA="$(git -C "$SRC" rev-parse HEAD 2>/dev/null)" || die "not a git checkout; pass --sha"
+  [[ -z "$(git -C "$SRC" status --porcelain 2>/dev/null)" ]] || DIRTY=true
+fi
+[[ "$SHA" =~ ^[A-Za-z0-9]{7,64}$ ]] || die "git sha must be 7-64 alphanumerics"
+
+SCHEMA=0
+if [[ -d "$SRC/$MIGRATIONS" ]]; then
+  for f in "$SRC/$MIGRATIONS"/*; do
+    [[ -f "$f" ]] || continue
+    n="$(basename "$f")"; n="${n%%[!0-9]*}"
+    [[ -n "$n" ]] || continue
+    n=$((10#$n)); (( n > SCHEMA )) && SCHEMA=$n
+  done
+fi
+
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ship-build.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+cp -R "$SRC/." "$STAGE/"
+rm -rf "$STAGE/.git" "$STAGE/MANIFEST.json"
+cat >"$STAGE/MANIFEST.json" <<JSON
+{
+  "name": "$NAME",
+  "version": "$VERSION",
+  "git_sha": "$SHA",
+  "git_dirty": $DIRTY,
+  "schema_version": $SCHEMA,
+  "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+
+mkdir -p "$OUT"
+FILE="$NAME-$VERSION-${SHA:0:7}.tar.gz"
+TAR_OPTS=(--owner=0 --group=0 --numeric-owner)
+tar --force-local --version >/dev/null 2>&1 && TAR_OPTS+=(--force-local)
+tar --sort=name -cf /dev/null --files-from /dev/null 2>/dev/null && TAR_OPTS+=(--sort=name)
+tar "${TAR_OPTS[@]}" -czf "$OUT/$FILE" -C "$STAGE" .
+(cd "$OUT" && sha256sum "$FILE" >"$FILE.sha256")
+echo "built $OUT/$FILE (version=$VERSION git_sha=${SHA:0:7} schema_version=$SCHEMA dirty=$DIRTY)"
+echo "sha256 $(awk '{print $1}' "$OUT/$FILE.sha256")"

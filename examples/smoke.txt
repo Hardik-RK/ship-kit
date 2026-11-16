@@ -1,0 +1,5 @@
+# One check per line:  METHOD PATH EXPECTED_STATUS [| text the body must contain [| request body]]
+# Paths are relative to the directory of HEALTH_URL. Prefer read-only checks; a POST here writes to
+# your production database on every deploy.
+GET /health 200 | "status":"ok"
+GET /items 200

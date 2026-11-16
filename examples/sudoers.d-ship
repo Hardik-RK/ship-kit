@@ -1,0 +1,2 @@
+# /etc/sudoers.d/ship : let the deploy user manage exactly one unit, nothing else.
+deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart myapp, /usr/bin/systemctl stop myapp, /usr/bin/systemctl start myapp, /usr/bin/systemctl is-active myapp

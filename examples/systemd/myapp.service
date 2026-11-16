@@ -1,0 +1,15 @@
+[Unit]
+Description=myapp
+After=network.target
+
+[Service]
+User=myapp
+WorkingDirectory=/srv/myapp/current
+# `current` is a symlink that `ship` flips atomically; restarting the unit picks up the new release.
+ExecStart=/usr/bin/node server.js
+Environment=PORT=8080 DB_PATH=/srv/myapp/shared/data/app.sqlite
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
