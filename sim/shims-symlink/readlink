@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+args=("$@"); last="${args[${#args[@]}-1]}"
+if [[ -f "$last" ]] && head -c 13 "$last" | grep -q '^SHIPSIM-LINK:'; then
+  sed -n 's/^SHIPSIM-LINK://p' "$last"; exit 0
+fi
+[[ -f "$last" ]] && [[ "${args[0]}" == -f ]] && { exec /usr/bin/readlink "$@"; }
+exec /usr/bin/readlink "$@"

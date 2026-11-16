@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Windows-only stand-in: unprivileged Git Bash cannot create symlinks, so `ln -sfn TARGET LINK`
+# writes a one-line "pointer file". Together with the readlink shim it behaves like a symlink
+# for ship. CI on Linux does NOT use this: it exercises real symlinks.
+if [[ "${1:-}" == -sfn ]]; then printf 'SHIPSIM-LINK:%s\n' "$2" >"$3"; else exec /usr/bin/ln "$@"; fi

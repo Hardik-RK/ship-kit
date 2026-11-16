@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Fake caddy: `caddy validate --config FILE` fails when the file contains the word INVALID.
+case "${1:-}" in
+  validate)
+    f=""; while [[ $# -gt 0 ]]; do [[ "$1" == --config ]] && f="$2"; shift; done
+    if grep -q INVALID "$f" 2>/dev/null; then echo "caddy (sim): invalid configuration" >&2; exit 1; fi
+    echo "caddy (sim): valid configuration" ;;
+  reload) echo "caddy (sim): reloaded" ;;
+  *) echo "caddy (sim): unsupported: $*" >&2; exit 1 ;;
+esac

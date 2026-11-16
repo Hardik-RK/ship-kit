@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Fake systemctl for the simulated server. "Starting the service" launches the demo app as a
+# child process from whatever the `current` pointer names. NOT real systemd: no cgroups, no
+# Restart=, no ordering. It only gives ship something with systemctl's observable behaviour.
+#   systemctl stop|start|restart|is-active|status UNIT
+set -u
+: "${SHIP_ROOT:?shim needs SHIP_ROOT}"
+S="$SHIP_ROOT/sim-svc"; mkdir -p "$S"
+cmd="${1:-}"; unit="${2:-}"
+pidf="$S/$unit.pid"; logf="$S/$unit.log"; started="$S/$unit.started"
+alive() { [[ -f "$pidf" ]] && kill -0 "$(cat "$pidf")" 2>/dev/null; }
+do_stop() {
+  if alive; then
+    local p; p="$(cat "$pidf")"; kill "$p" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
+    kill -9 "$p" 2>/dev/null || true
+  fi
+  rm -f "$pidf" "$started"
+}
+do_start() {
+  alive && return 0
+  local target; target="$(readlink "$SHIP_ROOT/current" 2>/dev/null || true)"
+  [[ -n "$target" && -d "$target" ]] || { echo "sim systemctl: no current release" >&2; return 1; }
+  : >"$started"
+  cd "$target" || return 1
+  PORT="${SIM_PORT:?}" DB_PATH="${SIM_DB:?}" node server.js >>"$logf" 2>&1 </dev/null &
+  echo $! >"$pidf"
+  return 0
+}
+case "$cmd" in
+  stop) do_stop ;;
+  start) do_start ;;
+  restart) do_stop; do_start ;;
+  is-active) if alive; then echo active; elif [[ -f "$started" ]]; then echo failed; exit 3; else echo inactive; exit 3; fi ;;
+  status) if alive; then echo "active (sim)"; else echo "inactive (sim)"; exit 3; fi ;;
+  *) echo "sim systemctl: unsupported: $*" >&2; exit 1 ;;
+esac
