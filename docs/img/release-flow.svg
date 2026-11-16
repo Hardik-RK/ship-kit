@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 340" width="880" height="340" role="img" aria-labelledby="t d" font-family="Inter Tight, Inter, Segoe UI, Helvetica, Arial, sans-serif">
+  <title id="t">ship-kit release flow</title>
+  <desc id="d">A release is built and checksummed, then ship deploy verifies the artifact, takes a verified database backup, rehearses the migration on a copy, switches the symlink and restarts, and checks health and smoke tests. Any failure after the switch triggers an automatic rollback. The monitor runs separately.</desc>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9 z" fill="#0a6fc2"/>
+    </marker>
+    <style>
+      .card { fill:#ffffff; stroke:#e3e6ea; stroke-width:1; }
+      .key { fill:#ffffff; stroke:#0a6fc2; stroke-width:1.5; }
+      .h { font-size:13px; font-weight:600; fill:#111827; }
+      .s { font-size:11px; fill:#5b6470; }
+      .pill { fill:#e3f1fd; }
+      .pt { font-size:11px; fill:#0b4f8a; font-family:JetBrains Mono, ui-monospace, Consolas, monospace; }
+      .mono { font-family:JetBrains Mono, ui-monospace, Consolas, monospace; }
+      .arrow { stroke:#0a6fc2; stroke-width:1.5; fill:none; marker-end:url(#ah); }
+    </style>
+  </defs>
+  <rect width="880" height="340" rx="12" fill="#ffffff"/>
+
+  <!-- top labels -->
+  <rect class="pill" x="20" y="14" width="96" height="20" rx="10"/>
+  <text class="pt" x="68" y="28" text-anchor="middle">ship-build</text>
+  <rect class="pill" x="164" y="14" width="140" height="20" rx="10"/>
+  <text class="pt" x="234" y="28" text-anchor="middle">ship deploy FILE</text>
+  <rect class="pill" x="740" y="14" width="120" height="20" rx="10"/>
+  <text class="pt" x="800" y="28" text-anchor="middle">all green: exit 0</text>
+
+  <!-- row 1 -->
+  <rect class="card" x="20" y="46" width="120" height="110" rx="10"/>
+  <text class="h" x="32" y="70">Build</text>
+  <text class="s" x="32" y="92">tarball + .sha256</text>
+  <text class="s" x="32" y="108">manifest: version,</text>
+  <text class="s" x="32" y="124">git sha, schema</text>
+
+  <rect class="card" x="164" y="46" width="120" height="110" rx="10"/>
+  <text class="h" x="176" y="70">Verify</text>
+  <text class="s" x="176" y="92">lock, SHA-256,</text>
+  <text class="s" x="176" y="108">path safety,</text>
+  <text class="s" x="176" y="124">manifest</text>
+
+  <rect class="card" x="308" y="46" width="120" height="110" rx="10"/>
+  <text class="h" x="320" y="70">Backup</text>
+  <text class="s" x="320" y="92">online DB copy,</text>
+  <text class="s" x="320" y="108">integrity_check,</text>
+  <text class="s" x="320" y="124">.ok sidecar</text>
+
+  <rect class="card" x="452" y="46" width="120" height="110" rx="10"/>
+  <text class="h" x="464" y="70">Preflight</text>
+  <text class="s" x="464" y="92">migrate a COPY</text>
+  <text class="s" x="464" y="108">of the backup,</text>
+  <text class="s" x="464" y="124">pre-switch hook</text>
+
+  <rect class="key" x="596" y="46" width="120" height="110" rx="10"/>
+  <text class="h" x="608" y="70">Switch</text>
+  <text class="s" x="608" y="92">migrate live DB</text>
+  <text class="s" x="608" y="108">if schema changed,</text>
+  <text class="s" x="608" y="124">repoint symlink,</text>
+  <text class="s" x="608" y="140">restart service</text>
+
+  <rect class="key" x="740" y="46" width="120" height="110" rx="10"/>
+  <text class="h" x="752" y="70">Health + smoke</text>
+  <text class="s" x="752" y="92">/health version</text>
+  <text class="s" x="752" y="108">== manifest,</text>
+  <text class="s" x="752" y="124">then smoke file</text>
+
+  <!-- row 1 arrows -->
+  <path class="arrow" d="M140,101 L162,101"/>
+  <path class="arrow" d="M284,101 L306,101"/>
+  <path class="arrow" d="M428,101 L450,101"/>
+  <path class="arrow" d="M572,101 L594,101"/>
+  <path class="arrow" d="M716,101 L738,101"/>
+
+  <!-- early exits -->
+  <rect class="pill" x="194" y="168" width="60" height="20" rx="10"/>
+  <text class="pt" x="224" y="182" text-anchor="middle">exit 4</text>
+  <rect class="pill" x="338" y="168" width="60" height="20" rx="10"/>
+  <text class="pt" x="368" y="182" text-anchor="middle">exit 5</text>
+  <rect class="pill" x="482" y="168" width="60" height="20" rx="10"/>
+  <text class="pt" x="512" y="182" text-anchor="middle">exit 6</text>
+  <text class="s" x="164" y="206">stop with nothing changed</text>
+
+  <!-- failure arrows into rollback -->
+  <path class="arrow" d="M656,156 L656,236"/>
+  <path class="arrow" d="M800,156 L800,236"/>
+  <rect class="pill" x="670" y="186" width="116" height="20" rx="10"/>
+  <text class="pt" x="728" y="200" text-anchor="middle">any failure</text>
+
+  <!-- rollback -->
+  <rect class="key" x="596" y="240" width="264" height="80" rx="10"/>
+  <text class="h" x="608" y="264">Automatic rollback</text>
+  <text class="s" x="608" y="284">stop, restore DB backup if migrated,</text>
+  <text class="s" x="608" y="300">repoint to previous, restart, recheck</text>
+  <rect class="pill" x="786" y="250" width="64" height="20" rx="10"/>
+  <text class="pt" x="818" y="264" text-anchor="middle">exit 7 / 8</text>
+
+  <!-- monitor -->
+  <rect class="card" x="20" y="240" width="420" height="80" rx="10"/>
+  <text class="h" x="32" y="264">Monitor (runs separately)</text>
+  <text class="s mono" x="32" y="284">monitor/src/cli.ts watch</text>
+  <text class="s" x="32" y="300">http, tls, disk + inodes, systemd, backup age, log rate</text>
+  <text class="s" x="250" y="284">to webhook, Telegram, email</text>
+</svg>
