@@ -1,0 +1,92 @@
+{
+  "name": "demo-app",
+  "intervalSeconds": 60,
+  "stateFile": "/var/lib/ship-monitor/state.json",
+  "statusFile": "/var/lib/ship-monitor/status.json",
+  "alerting": {
+    "failAfter": 2,
+    "recoverAfter": 2,
+    "repeatMinutes": 120,
+    "flap": {
+      "threshold": 4,
+      "windowMinutes": 30
+    }
+  },
+  "notifiers": [
+    {
+      "type": "webhook",
+      "url": "https://hooks.example.invalid/services/XXXX"
+    },
+    {
+      "type": "telegram",
+      "tokenEnv": "TELEGRAM_BOT_TOKEN",
+      "chatId": "123456789"
+    },
+    {
+      "type": "email",
+      "host": "smtp.example.invalid",
+      "port": 587,
+      "starttls": true,
+      "user": "alerts@example.invalid",
+      "passEnv": "SMTP_PASSWORD",
+      "from": "alerts@example.invalid",
+      "to": [
+        "oncall@example.invalid"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "name": "health",
+      "type": "http",
+      "url": "http://127.0.0.1:8080/health",
+      "expectStatus": 200,
+      "warnLatencyMs": 500,
+      "critLatencyMs": 2000,
+      "json": {
+        "field": "status",
+        "equals": "ok"
+      }
+    },
+    {
+      "name": "tls-cert",
+      "type": "tls",
+      "host": "app.example.invalid",
+      "warnDays": 21,
+      "critDays": 7
+    },
+    {
+      "name": "root-disk",
+      "type": "disk",
+      "path": "/",
+      "warnPercent": 80,
+      "critPercent": 90,
+      "inodeWarnPercent": 80,
+      "inodeCritPercent": 90
+    },
+    {
+      "name": "service",
+      "type": "systemd",
+      "unit": "demo-app"
+    },
+    {
+      "name": "db-backup",
+      "type": "backup",
+      "dir": "/srv/demo/shared/backups",
+      "pattern": "\\.bak$",
+      "requireMarker": true,
+      "warnHours": 26,
+      "critHours": 50
+    },
+    {
+      "name": "app-errors",
+      "type": "lograte",
+      "file": "/var/log/demo-app/app.log",
+      "windowMinutes": 10,
+      "warnCount": 5,
+      "critCount": 20,
+      "warnRatePercent": 5,
+      "critRatePercent": 20
+    }
+  ]
+}

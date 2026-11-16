@@ -1,0 +1,23 @@
+{
+  "name": "ship-kit",
+  "version": "0.1.0",
+  "description": "Safe releases and basic monitoring for a single-server app: checksummed tarballs, verified DB backups, auto-rollback, and a zero-dependency health monitor.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "schema": "node --experimental-strip-types --disable-warning=ExperimentalWarning monitor/src/schema.ts > monitor/config.schema.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
+    "test:monitor": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test \"monitor/test/*.test.ts\"",
+    "test:ship": "bash test/ship.test.sh",
+    "test": "npm run test:monitor && npm run test:ship",
+    "monitor": "node --experimental-strip-types --disable-warning=ExperimentalWarning monitor/src/cli.ts",
+    "demo": "bash demo/demo.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.0"
+  }
+}

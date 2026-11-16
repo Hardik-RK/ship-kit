@@ -1,0 +1,540 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ship-kit monitor configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "default": "app",
+      "minLength": 1
+    },
+    "intervalSeconds": {
+      "type": "number",
+      "minimum": 5,
+      "default": 60
+    },
+    "stateFile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "statusFile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "serve": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "port"
+      ]
+    },
+    "alerting": {
+      "type": "object",
+      "default": {},
+      "additionalProperties": false,
+      "properties": {
+        "failAfter": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2
+        },
+        "recoverAfter": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2
+        },
+        "repeatMinutes": {
+          "type": "number",
+          "minimum": 0,
+          "default": 120
+        },
+        "flap": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": false,
+          "properties": {
+            "threshold": {
+              "type": "integer",
+              "minimum": 2,
+              "default": 4
+            },
+            "windowMinutes": {
+              "type": "number",
+              "minimum": 1,
+              "default": 30
+            }
+          }
+        }
+      }
+    },
+    "notifiers": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/notifier"
+      }
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/check"
+      }
+    }
+  },
+  "required": [
+    "checks"
+  ],
+  "$defs": {
+    "check": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "type": {
+              "const": "http"
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "type": "string",
+              "enum": [
+                "GET",
+                "HEAD"
+              ],
+              "default": "GET",
+              "minLength": 1
+            },
+            "expectStatus": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 599,
+              "default": 200
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 100,
+              "default": 5000
+            },
+            "warnLatencyMs": {
+              "type": "number",
+              "minimum": 1
+            },
+            "critLatencyMs": {
+              "type": "number",
+              "minimum": 1
+            },
+            "json": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "field": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "equals": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "exists": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "field"
+              ]
+            },
+            "insecureTls": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "name",
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "type": {
+              "const": "tls"
+            },
+            "host": {
+              "type": "string",
+              "minLength": 1
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "default": 443
+            },
+            "servername": {
+              "type": "string",
+              "minLength": 1
+            },
+            "warnDays": {
+              "type": "number",
+              "minimum": 0,
+              "default": 21
+            },
+            "critDays": {
+              "type": "number",
+              "minimum": 0,
+              "default": 7
+            },
+            "requireTrusted": {
+              "type": "boolean",
+              "default": false
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 100,
+              "default": 5000
+            }
+          },
+          "required": [
+            "name",
+            "type",
+            "host"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "type": {
+              "const": "disk"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "warnPercent": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 80
+            },
+            "critPercent": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 90
+            },
+            "inodeWarnPercent": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 80
+            },
+            "inodeCritPercent": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 90
+            }
+          },
+          "required": [
+            "name",
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "type": {
+              "const": "systemd"
+            },
+            "unit": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "name",
+            "type",
+            "unit"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "type": {
+              "const": "backup"
+            },
+            "dir": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pattern": {
+              "type": "string",
+              "default": "\\.bak$",
+              "minLength": 1,
+              "format": "regex"
+            },
+            "requireMarker": {
+              "type": "boolean",
+              "default": false
+            },
+            "markerSuffix": {
+              "type": "string",
+              "default": ".ok",
+              "minLength": 1
+            },
+            "warnHours": {
+              "type": "number",
+              "minimum": 0,
+              "default": 26
+            },
+            "critHours": {
+              "type": "number",
+              "minimum": 0,
+              "default": 50
+            }
+          },
+          "required": [
+            "name",
+            "type",
+            "dir"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "type": {
+              "const": "lograte"
+            },
+            "file": {
+              "type": "string",
+              "minLength": 1
+            },
+            "windowMinutes": {
+              "type": "number",
+              "minimum": 1,
+              "default": 10
+            },
+            "errorPattern": {
+              "type": "string",
+              "default": "\\b(ERROR|FATAL|CRITICAL)\\b|level=error|\"level\":\\s*\"error\"",
+              "minLength": 1,
+              "format": "regex"
+            },
+            "warnCount": {
+              "type": "number",
+              "minimum": 1
+            },
+            "critCount": {
+              "type": "number",
+              "minimum": 1
+            },
+            "warnRatePercent": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "critRatePercent": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "minLinesForRate": {
+              "type": "number",
+              "minimum": 1,
+              "default": 20
+            },
+            "maxBytes": {
+              "type": "integer",
+              "minimum": 1024,
+              "default": 2000000
+            },
+            "missingIsOk": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "name",
+            "type",
+            "file"
+          ]
+        }
+      ]
+    },
+    "notifier": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "webhook"
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1
+            },
+            "headers": {
+              "type": "object"
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 100,
+              "default": 8000
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "telegram"
+            },
+            "tokenEnv": {
+              "type": "string",
+              "minLength": 1
+            },
+            "chatId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "apiBase": {
+              "type": "string",
+              "default": "https://api.telegram.org",
+              "minLength": 1
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 100,
+              "default": 8000
+            }
+          },
+          "required": [
+            "type",
+            "tokenEnv",
+            "chatId"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "email"
+            },
+            "host": {
+              "type": "string",
+              "minLength": 1
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "default": 587
+            },
+            "secure": {
+              "type": "boolean",
+              "default": false
+            },
+            "starttls": {
+              "type": "boolean",
+              "default": true
+            },
+            "insecureTls": {
+              "type": "boolean",
+              "default": false
+            },
+            "user": {
+              "type": "string",
+              "minLength": 1
+            },
+            "passEnv": {
+              "type": "string",
+              "minLength": 1
+            },
+            "from": {
+              "type": "string",
+              "minLength": 1
+            },
+            "to": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            },
+            "heloName": {
+              "type": "string",
+              "default": "ship-kit-monitor",
+              "minLength": 1
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 100,
+              "default": 10000
+            }
+          },
+          "required": [
+            "type",
+            "host",
+            "from",
+            "to"
+          ]
+        }
+      ]
+    }
+  }
+}
