@@ -99,5 +99,5 @@
   <text class="h" x="32" y="264">Monitor (runs separately)</text>
   <text class="s mono" x="32" y="284">monitor/src/cli.ts watch</text>
   <text class="s" x="32" y="300">http, tls, disk + inodes, systemd, backup age, log rate</text>
-  <text class="s" x="250" y="284">to webhook, Telegram, email</text>
+  <text class="s" x="212" y="284">to webhook, Telegram, email</text>
 </svg>
