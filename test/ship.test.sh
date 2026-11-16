@@ -168,7 +168,7 @@ t_unhealthy_release_rolls_back_without_touching_db() {
   ship deploy "$(sim_release 1.4.0)"; assert_rc 7
   assert_has "ROLLING BACK"; assert_lacks "database restored"; assert_lacks "database NOT restored"
   assert_eq "$(live_version)" "1.1.0"; assert_eq "$(current_id)" "1.1.0-34fcc21"
-  compgen -G "$SIM_ROOT/shared/data/*.failed-*" >/dev/null && fail "a DB swap happened"
+  if compgen -G "$SIM_ROOT/shared/data/*.failed-*" >/dev/null; then fail "a DB swap happened"; fi
 }
 t_rollback_without_db_restore_after_migration_cannot_serve() {
   # ROLLBACK_RESTORE_DB=never: the old code meets the migrated schema and cannot start.
