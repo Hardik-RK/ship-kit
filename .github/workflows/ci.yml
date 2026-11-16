@@ -1,0 +1,59 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q shellcheck
+          shellcheck -x bin/ship bin/ship-build sim/sim.sh sim/shims/* sim/shims-symlink/* demo/make-releases.sh demo/demo.sh test/ship.test.sh
+
+  ship-harness:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q sqlite3
+      - name: bash harness (real symlinks, simulated systemctl)
+        run: bash test/ship.test.sh
+      - name: demo runs end to end
+        run: bash demo/demo.sh
+
+  ship-debian:
+    # Same harness inside a clean Debian image, to catch "works on my distro" assumptions.
+    runs-on: ubuntu-24.04
+    container: node:22-bookworm   # Debian 12 with Node 22
+    steps:
+      - name: tools
+        run: apt-get update -q && apt-get install -y -q sqlite3 curl procps
+      - uses: actions/checkout@v4
+      - name: harness on Debian
+        run: |
+          node --version
+          bash test/ship.test.sh
+
+  monitor:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:monitor
+      - name: compiled JS build runs
+        run: |
+          npm run build
+          node dist/cli.js validate --config examples/monitor.yaml
