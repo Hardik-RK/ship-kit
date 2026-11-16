@@ -28,7 +28,7 @@ run() {
 ship() { "$SHIP" "$@"; }
 
 say "The 'server': releases/, current -> a release, shared/ (database + backups), ship.conf"
-cat "$SIM_ROOT/ship.conf" | tidy
+tidy <"$SIM_ROOT/ship.conf"
 
 say "1. First deploy of 1.0.0 (no database yet, so no backup; the migration creates it)"
 run ship deploy "$(sim_release 1.0.0)"

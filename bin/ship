@@ -132,10 +132,10 @@ current_target() { # absolute path of the live release, or empty
   echo "$t"
 }
 release_version() { # RELEASE_DIR -> version from its manifest
-  [[ -f "$1/MANIFEST.json" ]] && json_get version <"$1/MANIFEST.json" || true
+  if [[ -f "$1/MANIFEST.json" ]]; then json_get version <"$1/MANIFEST.json"; fi
 }
 release_schema() {
-  [[ -f "$1/MANIFEST.json" ]] && json_get schema_version <"$1/MANIFEST.json" || true
+  if [[ -f "$1/MANIFEST.json" ]]; then json_get schema_version <"$1/MANIFEST.json"; fi
 }
 atomic_switch() { # TARGET_DIR: replace the symlink with a single rename(2)
   ln -sfn "$1" "$CURRENT.new"
@@ -365,7 +365,7 @@ cmd_deploy() {
   [[ -n "$tarball" && -f "$tarball" ]] || die $EX_USAGE deploy "usage: ship deploy <release.tar.gz> [--dry-run] [--force]"
   load_config; need_tools
   LOG_FILE="$STATE/ship.log"
-  (( DRY )) && log info deploy "DRY RUN: nothing will be changed" || true
+  if (( DRY )); then log info deploy "DRY RUN: nothing will be changed"; fi
   if (( DRY )); then check_lock_dry; else acquire_lock; trap cleanup EXIT; fi
 
   verify_artifact "$tarball" || exit $EX_ARTIFACT
